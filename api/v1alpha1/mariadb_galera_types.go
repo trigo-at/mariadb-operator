@@ -408,6 +408,12 @@ type GaleraRecoveryStatus struct {
 	Recovered map[string]*recovery.Bootstrap `json:"recovered,omitempty"`
 	// Bootstrap indicates when and in which Pod the cluster bootstrap process has been performed.
 	Bootstrap *GaleraBootstrapStatus `json:"bootstrap,omitempty"`
+	// LastSelectedSource is the most advanced position ever selected as a bootstrap source during the ongoing recovery.
+	// It is preserved when the recovery status is reset (e.g. after exceeding clusterBootstrapTimeout) and acts as a
+	// safety floor: a newly selected bootstrap source must be at least as advanced. This prevents the recovery process
+	// from bootstrapping the cluster from a node with less data (e.g. after an interrupted SST), which would result in
+	// data loss. See https://github.com/mariadb-operator/mariadb-operator/issues/1108.
+	LastSelectedSource *recovery.Bootstrap `json:"lastSelectedSource,omitempty"`
 	// PodsRestarted that the Pods have been restarted after the cluster bootstrap.
 	PodsRestarted *bool `json:"podsRestarted,omitempty"`
 }

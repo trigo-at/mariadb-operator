@@ -16,6 +16,10 @@ const (
 	BootstrapFileName = "1-bootstrap.cnf"
 	BootstrapFile     = `[galera]
 wsrep_new_cluster="ON"`
+	// ZeroUUID is the UUID reported by nodes that don't have a valid cluster state,
+	// for example after an interrupted SST or on a freshly initialized data directory.
+	// See: https://galeracluster.com/library/documentation/node-provisioning.html#node-provisioning
+	ZeroUUID = "00000000-0000-0000-0000-000000000000"
 )
 
 type GaleraRecoverer interface {

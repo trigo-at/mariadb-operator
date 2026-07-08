@@ -95,7 +95,7 @@ func (r *GaleraReconciler) recoverCluster(ctx context.Context, mariadb *mariadbv
 		if err != nil {
 			return fmt.Errorf("error getting source to forcefully bootstrap: %v", err)
 		}
-		rs.setBootstrapping(src.pod)
+		rs.setBootstrapping(src.pod, src.bootstrap)
 		return r.patchRecoveryStatus(ctx, mariadb, rs)
 	}
 
@@ -116,7 +116,7 @@ func (r *GaleraReconciler) recoverCluster(ctx context.Context, mariadb *mariadbv
 		logger.V(1).Info("Error getting bootstrap source", "err", err)
 	}
 	if src != nil {
-		rs.setBootstrapping(src.pod)
+		rs.setBootstrapping(src.pod, src.bootstrap)
 		return r.patchRecoveryStatus(ctx, mariadb, rs)
 	}
 
@@ -136,7 +136,7 @@ func (r *GaleraReconciler) recoverCluster(ctx context.Context, mariadb *mariadbv
 	if err != nil {
 		return fmt.Errorf("error getting bootstrap source: %v", err)
 	}
-	rs.setBootstrapping(src.pod)
+	rs.setBootstrapping(src.pod, src.bootstrap)
 	if err := r.patchRecoveryStatus(ctx, mariadb, rs); err != nil {
 		return fmt.Errorf("error patching recovery status: %v", err)
 	}

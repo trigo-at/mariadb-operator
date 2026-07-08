@@ -1493,6 +1493,11 @@ func (in *GaleraRecoveryStatus) DeepCopyInto(out *GaleraRecoveryStatus) {
 		*out = new(GaleraBootstrapStatus)
 		(*in).DeepCopyInto(*out)
 	}
+	if in.LastSelectedSource != nil {
+		in, out := &in.LastSelectedSource, &out.LastSelectedSource
+		*out = new(recovery.Bootstrap)
+		**out = **in
+	}
 	if in.PodsRestarted != nil {
 		in, out := &in.PodsRestarted, &out.PodsRestarted
 		*out = new(bool)

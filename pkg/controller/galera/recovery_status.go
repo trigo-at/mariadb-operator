@@ -48,6 +48,9 @@ func newRecoveryStatus(mariadb *mariadbv1alpha1.MariaDB) *recoveryStatus {
 	if galeraRecovery.Bootstrap != nil {
 		inner.Bootstrap = galeraRecovery.Bootstrap
 	}
+	if galeraRecovery.LastSelectedSource != nil {
+		inner.LastSelectedSource = galeraRecovery.LastSelectedSource
+	}
 	if galeraRecovery.PodsRestarted != nil {
 		inner.PodsRestarted = galeraRecovery.PodsRestarted
 	}
@@ -104,16 +107,27 @@ func (rs *recoveryStatus) reset() {
 	rs.mux.Lock()
 	defer rs.mux.Unlock()
 
-	rs.inner = mariadbv1alpha1.GaleraRecoveryStatus{}
+	// Preserve the last selected bootstrap source as a safety floor across resets, so that a
+	// subsequent recovery attempt can never select a less advanced node (e.g. a node left with
+	// an empty data directory by an interrupted SST) as bootstrap source, which would result in
+	// data loss. See https://github.com/mariadb-operator/mariadb-operator/issues/1108.
+	rs.inner = mariadbv1alpha1.GaleraRecoveryStatus{
+		LastSelectedSource: rs.inner.LastSelectedSource,
+	}
 }
 
-func (rs *recoveryStatus) setBootstrapping(pod string) {
+func (rs *recoveryStatus) setBootstrapping(pod string, source *recovery.Bootstrap) {
 	rs.mux.Lock()
 	defer rs.mux.Unlock()
 
 	rs.inner.Bootstrap = &mariadbv1alpha1.GaleraBootstrapStatus{
 		Time: ptr.To(metav1.NewTime(time.Now())),
 		Pod:  &pod,
+	}
+	// Track the most advanced source ever selected during this recovery. It acts as a safety
+	// floor for future source selections, see bootstrapSource.
+	if source != nil && (rs.inner.LastSelectedSource == nil || source.Compare(rs.inner.LastSelectedSource) >= 0) {
+		rs.inner.LastSelectedSource = source
 	}
 }
 
@@ -160,7 +174,13 @@ func (rs *recoveryStatus) isComplete(mdb *mariadbv1alpha1.MariaDB, logger logr.L
 		recovered := rs.inner.Recovered[p]
 
 		if state != nil && state.SafeToBootstrap {
-			return true
+			if isViableSource(state) {
+				return true
+			}
+			logger.Info(
+				"Pod is marked as safe to bootstrap, but it does not have a valid Galera state. Ignoring safe to bootstrap",
+				"pod", p, "uuid", state.GetUUID(), "seqno", state.GetSeqno(),
+			)
 		}
 		if shouldSkipRecoverer(recovered) {
 			numSkippedPods++
@@ -209,30 +229,72 @@ func (rs *recoveryStatus) bootstrapSource(mdb *mariadbv1alpha1.MariaDB, forceBoo
 		recovered := rs.inner.Recovered[p]
 
 		if state != nil && state.SafeToBootstrap {
-			return &bootstrapSource{
-				bootstrap: &recovery.Bootstrap{
-					UUID:  state.GetUUID(),
-					Seqno: state.GetSeqno(),
-				},
-				pod: p,
-			}, nil
+			if isViableSource(state) {
+				return &bootstrapSource{
+					bootstrap: &recovery.Bootstrap{
+						UUID:  state.GetUUID(),
+						Seqno: state.GetSeqno(),
+					},
+					pod: p,
+				}, nil
+			}
+			logger.Info(
+				"Pod is marked as safe to bootstrap, but it does not have a valid Galera state. Ignoring safe to bootstrap",
+				"pod", p, "uuid", state.GetUUID(), "seqno", state.GetSeqno(),
+			)
 		}
 		if shouldSkipRecoverer(recovered) {
 			logger.Info("Skipping Pod while looking for a bootstrap source", "pod", p)
 			continue
 		}
-		if validSeqno(state) && state.Compare(currentSource) >= 0 {
+		if isViableSource(state) && state.Compare(currentSource) >= 0 {
 			currentSource = state
 			currentPod = p
 		}
-		if validSeqno(recovered) && recovered.Compare(currentSource) >= 0 {
+		if isViableSource(recovered) && recovered.Compare(currentSource) >= 0 {
 			currentSource = recovered
 			currentPod = p
 		}
 	}
 
+	if currentSource == nil && rs.inner.LastSelectedSource == nil {
+		// Fallback: none of the Pods has a valid (non zero UUID) cluster state and no bootstrap
+		// source has previously been selected during this recovery. This can only legitimately
+		// happen when none of the Pods has Galera state at all (e.g. when bootstrapping a cluster
+		// from restored or pre-existing PVCs without Galera history): in this situation there is no
+		// data that could be lost by bootstrapping from a Pod with a zero UUID. If any Pod had a
+		// valid cluster state, it would have been selected above, and if its state was unknown, the
+		// recovery would not have been considered complete.
+		for _, p := range pods {
+			state := rs.inner.State[p]
+			recovered := rs.inner.Recovered[p]
+
+			if validSeqno(state) && state.Compare(currentSource) >= 0 {
+				currentSource = state
+				currentPod = p
+			}
+			if validSeqno(recovered) && recovered.Compare(currentSource) >= 0 {
+				currentSource = recovered
+				currentPod = p
+			}
+		}
+	}
+
 	if currentSource == nil {
 		return nil, errors.New("bootstrap source not found")
+	}
+	// Never select a bootstrap source that is behind the most advanced source previously selected
+	// during this recovery. This prevents data loss when the recovery status is reset (e.g. after
+	// exceeding clusterBootstrapTimeout) and the Pods that previously held the most advanced state
+	// are no longer able to report it (e.g. after an interrupted SST).
+	// See https://github.com/mariadb-operator/mariadb-operator/issues/1108.
+	if floor := rs.inner.LastSelectedSource; floor != nil && currentSource.Compare(floor) < 0 {
+		return nil, fmt.Errorf(
+			"refusing to bootstrap from Pod '%s' (uuid=%s seqno=%d): it is behind the previously selected bootstrap source "+
+				"(uuid=%s seqno=%d) and bootstrapping from it could result in data loss. "+
+				"If this is intended, set 'spec.galera.recovery.forceClusterBootstrapInPod' to bootstrap from a specific Pod",
+			currentPod, currentSource.GetUUID(), currentSource.GetSeqno(), floor.UUID, floor.Seqno,
+		)
 	}
 	return &bootstrapSource{
 		bootstrap: &recovery.Bootstrap{
@@ -251,6 +313,15 @@ func validSeqno(recoverer recovery.GaleraRecoverer) bool {
 	return recoverer.GetSeqno() >= 0
 }
 
+// isViableSource determines whether the recoverer is viable to be used as a bootstrap source:
+// it must have a valid sequence number and a non-zero UUID. Nodes with a zero UUID do not have
+// a valid cluster state (e.g. empty data directory or interrupted SST) and must never be used
+// as a bootstrap source, as the rest of the nodes would replicate their (empty) state via SST,
+// resulting in data loss. See https://github.com/mariadb-operator/mariadb-operator/issues/1108.
+func isViableSource(recoverer recovery.GaleraRecoverer) bool {
+	return validSeqno(recoverer) && recoverer.GetUUID() != recovery.ZeroUUID
+}
+
 // shouldSkipRecoverer determines whether a recoverer should be skipped during the recovery process.
 // UUID 00000000-0000-0000-0000-000000000000 means that the Pods needs SST to rejoin the cluster.
 // See: https://galeracluster.com/library/documentation/node-provisioning.html#node-provisioning
@@ -259,7 +330,7 @@ func shouldSkipRecoverer(recoverer recovery.GaleraRecoverer) bool {
 	if recoverer == nil || (reflect.ValueOf(recoverer).IsNil()) {
 		return false
 	}
-	return recoverer.GetUUID() == "00000000-0000-0000-0000-000000000000" && recoverer.GetSeqno() == -1
+	return recoverer.GetUUID() == recovery.ZeroUUID && recoverer.GetSeqno() == -1
 }
 
 func (rs *recoveryStatus) setPodsRestarted(restarted bool) {

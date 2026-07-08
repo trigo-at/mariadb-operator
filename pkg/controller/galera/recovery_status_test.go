@@ -1628,3 +1628,342 @@ func TestRecoveryStatusPodsRestarted(t *testing.T) {
 		t.Error("expect recovery status to have Pods restarted")
 	}
 }
+
+// TestRecoveryStatusBootstrapSourceDataLossPrevention covers the scenarios described in
+// https://github.com/mariadb-operator/mariadb-operator/issues/1108, where the recovery
+// process could select a node without a valid cluster state (e.g. after an interrupted SST)
+// as bootstrap source, resulting in the rest of the nodes replicating its empty state via SST.
+func TestRecoveryStatusBootstrapSourceDataLossPrevention(t *testing.T) {
+	objMeta := metav1.ObjectMeta{
+		Name: "mariadb-galera",
+	}
+	validUUID := "f7f695b6-5000-11ef-8b0d-87e9e0e7b347"
+	zeroUUID := "00000000-0000-0000-0000-000000000000"
+	newMdb := func(status mariadbv1alpha1.GaleraRecoveryStatus) *mariadbv1alpha1.MariaDB {
+		return &mariadbv1alpha1.MariaDB{
+			ObjectMeta: objMeta,
+			Spec: mariadbv1alpha1.MariaDBSpec{
+				Replicas: 3,
+			},
+			Status: mariadbv1alpha1.MariaDBStatus{
+				GaleraRecovery: &status,
+			},
+		}
+	}
+
+	tests := []struct {
+		name                string
+		mdb                 *mariadbv1alpha1.MariaDB
+		forceBootstrapInPod *string
+		wantSource          *bootstrapSource
+		wantErr             bool
+	}{
+		{
+			name: "zero UUID Pod marked as safe to bootstrap is not selected",
+			mdb: newMdb(mariadbv1alpha1.GaleraRecoveryStatus{
+				State: map[string]*recovery.GaleraState{
+					"mariadb-galera-0": {
+						Version:         "2.1",
+						UUID:            zeroUUID,
+						Seqno:           -1,
+						SafeToBootstrap: true,
+					},
+					"mariadb-galera-1": {
+						Version:         "2.1",
+						UUID:            validUUID,
+						Seqno:           100,
+						SafeToBootstrap: false,
+					},
+					"mariadb-galera-2": {
+						Version:         "2.1",
+						UUID:            validUUID,
+						Seqno:           99,
+						SafeToBootstrap: false,
+					},
+				},
+				Recovered: map[string]*recovery.Bootstrap{
+					"mariadb-galera-0": {
+						UUID:  zeroUUID,
+						Seqno: -1,
+					},
+				},
+			}),
+			wantSource: &bootstrapSource{
+				bootstrap: &recovery.Bootstrap{
+					UUID:  validUUID,
+					Seqno: 100,
+				},
+				pod: "mariadb-galera-1",
+			},
+			wantErr: false,
+		},
+		{
+			name: "zero UUID recovered Pod with non-negative seqno is not selected",
+			mdb: newMdb(mariadbv1alpha1.GaleraRecoveryStatus{
+				Recovered: map[string]*recovery.Bootstrap{
+					"mariadb-galera-0": {
+						UUID:  zeroUUID,
+						Seqno: 0,
+					},
+					"mariadb-galera-1": {
+						UUID:  validUUID,
+						Seqno: 100,
+					},
+					"mariadb-galera-2": {
+						UUID:  validUUID,
+						Seqno: 99,
+					},
+				},
+			}),
+			wantSource: &bootstrapSource{
+				bootstrap: &recovery.Bootstrap{
+					UUID:  validUUID,
+					Seqno: 100,
+				},
+				pod: "mariadb-galera-1",
+			},
+			wantErr: false,
+		},
+		{
+			name: "all Pods with zero UUID: no bootstrap source",
+			mdb: newMdb(mariadbv1alpha1.GaleraRecoveryStatus{
+				Recovered: map[string]*recovery.Bootstrap{
+					"mariadb-galera-0": {
+						UUID:  zeroUUID,
+						Seqno: -1,
+					},
+					"mariadb-galera-1": {
+						UUID:  zeroUUID,
+						Seqno: -1,
+					},
+					"mariadb-galera-2": {
+						UUID:  zeroUUID,
+						Seqno: -1,
+					},
+				},
+			}),
+			wantSource: nil,
+			wantErr:    true,
+		},
+		{
+			name: "source behind the previously selected source is refused",
+			mdb: newMdb(mariadbv1alpha1.GaleraRecoveryStatus{
+				LastSelectedSource: &recovery.Bootstrap{
+					UUID:  validUUID,
+					Seqno: 100,
+				},
+				Recovered: map[string]*recovery.Bootstrap{
+					"mariadb-galera-0": {
+						UUID:  validUUID,
+						Seqno: 3,
+					},
+					"mariadb-galera-1": {
+						UUID:  zeroUUID,
+						Seqno: -1,
+					},
+					"mariadb-galera-2": {
+						UUID:  zeroUUID,
+						Seqno: -1,
+					},
+				},
+			}),
+			wantSource: nil,
+			wantErr:    true,
+		},
+		{
+			name: "source as advanced as the previously selected source is accepted",
+			mdb: newMdb(mariadbv1alpha1.GaleraRecoveryStatus{
+				LastSelectedSource: &recovery.Bootstrap{
+					UUID:  validUUID,
+					Seqno: 100,
+				},
+				Recovered: map[string]*recovery.Bootstrap{
+					"mariadb-galera-0": {
+						UUID:  validUUID,
+						Seqno: 100,
+					},
+					"mariadb-galera-1": {
+						UUID:  zeroUUID,
+						Seqno: -1,
+					},
+					"mariadb-galera-2": {
+						UUID:  zeroUUID,
+						Seqno: -1,
+					},
+				},
+			}),
+			wantSource: &bootstrapSource{
+				bootstrap: &recovery.Bootstrap{
+					UUID:  validUUID,
+					Seqno: 100,
+				},
+				pod: "mariadb-galera-0",
+			},
+			wantErr: false,
+		},
+		{
+			name: "source more advanced than the previously selected source is accepted",
+			mdb: newMdb(mariadbv1alpha1.GaleraRecoveryStatus{
+				LastSelectedSource: &recovery.Bootstrap{
+					UUID:  validUUID,
+					Seqno: 100,
+				},
+				Recovered: map[string]*recovery.Bootstrap{
+					"mariadb-galera-0": {
+						UUID:  validUUID,
+						Seqno: 150,
+					},
+					"mariadb-galera-1": {
+						UUID:  zeroUUID,
+						Seqno: -1,
+					},
+					"mariadb-galera-2": {
+						UUID:  zeroUUID,
+						Seqno: -1,
+					},
+				},
+			}),
+			wantSource: &bootstrapSource{
+				bootstrap: &recovery.Bootstrap{
+					UUID:  validUUID,
+					Seqno: 150,
+				},
+				pod: "mariadb-galera-0",
+			},
+			wantErr: false,
+		},
+		{
+			// Preserves the pre-existing behavior for clusters bootstrapped from restored or
+			// pre-existing PVCs without Galera history: when no Pod in the cluster has a valid
+			// cluster state, there is no data that could be lost.
+			name: "uniform zero UUID cluster without previously selected source: highest seqno selected",
+			mdb: newMdb(mariadbv1alpha1.GaleraRecoveryStatus{
+				Recovered: map[string]*recovery.Bootstrap{
+					"mariadb-galera-0": {
+						UUID:  zeroUUID,
+						Seqno: 0,
+					},
+					"mariadb-galera-1": {
+						UUID:  zeroUUID,
+						Seqno: 0,
+					},
+					"mariadb-galera-2": {
+						UUID:  zeroUUID,
+						Seqno: 1,
+					},
+				},
+			}),
+			wantSource: &bootstrapSource{
+				bootstrap: &recovery.Bootstrap{
+					UUID:  zeroUUID,
+					Seqno: 1,
+				},
+				pod: "mariadb-galera-2",
+			},
+			wantErr: false,
+		},
+		{
+			// A cluster that previously selected a bootstrap source had data: it must never fall
+			// back to bootstrapping from Pods without a valid cluster state.
+			name: "uniform zero UUID cluster with previously selected source is refused",
+			mdb: newMdb(mariadbv1alpha1.GaleraRecoveryStatus{
+				LastSelectedSource: &recovery.Bootstrap{
+					UUID:  validUUID,
+					Seqno: 100,
+				},
+				Recovered: map[string]*recovery.Bootstrap{
+					"mariadb-galera-0": {
+						UUID:  zeroUUID,
+						Seqno: 0,
+					},
+					"mariadb-galera-1": {
+						UUID:  zeroUUID,
+						Seqno: 0,
+					},
+					"mariadb-galera-2": {
+						UUID:  zeroUUID,
+						Seqno: 1,
+					},
+				},
+			}),
+			wantSource: nil,
+			wantErr:    true,
+		},
+		{
+			name: "force bootstrap bypasses the previously selected source floor",
+			mdb: newMdb(mariadbv1alpha1.GaleraRecoveryStatus{
+				LastSelectedSource: &recovery.Bootstrap{
+					UUID:  validUUID,
+					Seqno: 100,
+				},
+			}),
+			forceBootstrapInPod: func() *string { s := "mariadb-galera-2"; return &s }(),
+			wantSource: &bootstrapSource{
+				pod: "mariadb-galera-2",
+			},
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rs := newRecoveryStatus(tt.mdb)
+			source, err := rs.bootstrapSource(tt.mdb, tt.forceBootstrapInPod, logr.Logger{})
+			if !reflect.DeepEqual(tt.wantSource, source) {
+				t.Errorf("unexpected bootstrapSource value: expected: %v, got: %v", tt.wantSource, source)
+			}
+			if tt.wantErr && err == nil {
+				t.Error("expect error to have occurred, got nil")
+			}
+			if !tt.wantErr && err != nil {
+				t.Errorf("expect error to not have occurred, got: %v", err)
+			}
+		})
+	}
+}
+
+// TestRecoveryStatusResetPreservesLastSelectedSource ensures that the safety floor introduced to
+// prevent data loss (see https://github.com/mariadb-operator/mariadb-operator/issues/1108) survives
+// recovery status resets triggered after exceeding clusterBootstrapTimeout.
+func TestRecoveryStatusResetPreservesLastSelectedSource(t *testing.T) {
+	validUUID := "f7f695b6-5000-11ef-8b0d-87e9e0e7b347"
+	rs := newRecoveryStatus(&mariadbv1alpha1.MariaDB{})
+
+	rs.setBootstrapping("mariadb-galera-1", &recovery.Bootstrap{
+		UUID:  validUUID,
+		Seqno: 100,
+	})
+	if !rs.isBootstrapping() {
+		t.Error("expect recovery status to be bootstrapping")
+	}
+
+	rs.reset()
+
+	if rs.isBootstrapping() {
+		t.Error("expect recovery status to not be bootstrapping after reset")
+	}
+	status := rs.galeraRecoveryStatus()
+	if status.LastSelectedSource == nil {
+		t.Fatal("expect LastSelectedSource to be preserved after reset")
+	}
+	if status.LastSelectedSource.Seqno != 100 || status.LastSelectedSource.UUID != validUUID {
+		t.Errorf("unexpected LastSelectedSource after reset: %v", status.LastSelectedSource)
+	}
+
+	// A less advanced source must not lower the floor.
+	rs.setBootstrapping("mariadb-galera-0", &recovery.Bootstrap{
+		UUID:  validUUID,
+		Seqno: 5,
+	})
+	status = rs.galeraRecoveryStatus()
+	if status.LastSelectedSource.Seqno != 100 {
+		t.Errorf("expect LastSelectedSource seqno to remain 100, got: %d", status.LastSelectedSource.Seqno)
+	}
+
+	// A forceful bootstrap (nil source) must not alter the floor.
+	rs.setBootstrapping("mariadb-galera-2", nil)
+	status = rs.galeraRecoveryStatus()
+	if status.LastSelectedSource == nil || status.LastSelectedSource.Seqno != 100 {
+		t.Errorf("expect LastSelectedSource to be unchanged by forceful bootstrap, got: %v", status.LastSelectedSource)
+	}
+}
